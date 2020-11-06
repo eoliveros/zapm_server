@@ -515,6 +515,11 @@ def _format_direction(view, context, model, name):
     elif model.direction == 1:
         return Markup('in')
 
+def _format_get_wallet_balance(view, context, model, name):
+    if model.wallet_address:
+        balance = model.wallet_address
+        return Markup(balance)
+
 class ReloadingIterator:
     def __init__(self, iterator_factory):
         self.iterator_factory = iterator_factory
@@ -619,11 +624,6 @@ class UserModelView(RestrictedModelView):
             msg = Message('Thank you for signing up to retail.zap.me', recipients=[model.email])
             msg.html = 'Thank you {}. <br/><br/><p>Please click <a href="{}/admin/reset">reset</a> and enter the registered email to reset your password.</p>'.format(model.merchant_name, app.config["SITE_URL"])
             mail.send(msg)
-
-    def _format_get_wallet_balance(view, context, model, name):
-        if model.wallet_address:
-            balance = model.wallet_address
-            return balance
 
     column_list = ['merchant_name', 'merchant_code', 'email', 'roles', 'max_settlements_per_month', 'settlement_fee', 'merchant_rate', 'customer_rate', 'wallet_address', 'wallet_balance']
     column_formatters = dict(wallet_balance=_format_get_wallet_balance)
