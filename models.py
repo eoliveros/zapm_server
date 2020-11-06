@@ -518,8 +518,8 @@ def _format_direction(view, context, model, name):
 def _format_get_wallet_balance(view, context, model, name):
     if model.wallet_address:
         wallet_address = model.wallet_address
-        balance = get_balance(wallet_address)
-        return Markup(balance)
+        zap_balance = get_balance(wallet_address)
+        return Markup(zap_balance)
 
 class ReloadingIterator:
     def __init__(self, iterator_factory):
