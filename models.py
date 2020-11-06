@@ -29,6 +29,7 @@ from wtforms.validators import DataRequired
 
 from app_core import app, db, aw, mail
 from utils import generate_key, ib4b_response, bankaccount_is_valid, blockchain_transactions, apply_merchant_rate, is_email, generate_random_password
+from app import get_update_balance
 
 logger = logging.getLogger(__name__)
 
