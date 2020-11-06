@@ -517,7 +517,7 @@ def _format_direction(view, context, model, name):
 
 def _format_get_wallet_balance(view, context, model, name):
     if model.wallet_address:
-        balance = model.wallet_address
+        balance = get_update_balance(model.wallet_address)
         return Markup(balance)
 
 class ReloadingIterator:
