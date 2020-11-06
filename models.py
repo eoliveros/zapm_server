@@ -28,7 +28,7 @@ import qrcode.image.svg
 from wtforms.validators import DataRequired
 
 from app_core import app, db, aw, mail
-from utils import generate_key, ib4b_response, bankaccount_is_valid, blockchain_transactions, apply_merchant_rate, is_email, generate_random_password, get_update_balance
+from utils import generate_key, ib4b_response, bankaccount_is_valid, blockchain_transactions, apply_merchant_rate, is_email, generate_random_password, get_balance
 
 logger = logging.getLogger(__name__)
 
@@ -517,7 +517,7 @@ def _format_direction(view, context, model, name):
 
 def _format_get_wallet_balance(view, context, model, name):
     if model.wallet_address:
-        balance = get_update_balance(model.wallet_address)
+        balance = get_balance(model.wallet_address)
         return Markup(balance)
 
 class ReloadingIterator:

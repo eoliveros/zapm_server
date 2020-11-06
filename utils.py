@@ -104,23 +104,23 @@ def get_balance(wallet_address):
         return balance
     return -1
 
-def get_update_balance(wallet_address):
-    now = time.time()
-    if wallet_address in wallet_balances:
-        timestamp, balance = wallet_balances[wallet_address]
-        # check if balance has expired
-        if now - timestamp > 60 * 10:
-            # update balance and timestamp
-            balance = get_balance(wallet_address)
-            wallet_balances[wallet_address] = (now, balance)
-            # return new balance
-            return balance
-        else:
-            # return cached balance
-            return balance
-    else:
-        # initial balance and timestamp
-        balance = get_balance(wallet_address)
-        wallet_balances[wallet_address] = (now, balance)
-        # return initial balance
-        return balance
+#def get_update_balance(wallet_address):
+#    now = time.time()
+#    if wallet_address in wallet_balances:
+#        timestamp, balance = wallet_balances[wallet_address]
+#        # check if balance has expired
+#        if now - timestamp > 60 * 10:
+#            # update balance and timestamp
+#            balance = get_balance(wallet_address)
+#            wallet_balances[wallet_address] = (now, balance)
+#            # return new balance
+#            return balance
+#        else:
+#            # return cached balance
+#            return balance
+#    else:
+#        # initial balance and timestamp
+#        balance = get_balance(wallet_address)
+#        wallet_balances[wallet_address] = (now, balance)
+#        # return initial balance
+#        return balance
