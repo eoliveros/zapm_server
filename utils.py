@@ -92,3 +92,34 @@ def generate_random_password(length):
     password_characters = string.ascii_letters + string.digits + string.punctuation
     secret_password = ''.join(secrets.choice(password_characters) for i in range(length))
     return secret_password
+
+def get_balance(wallet_address):
+    url = '%s/assets/balance/%s/%s' % (app.config["NODE_ADDRESS"], wallet_address, app.config["ASSET_ID"])
+    print(':: getting balance - %s' % url)
+    r = requests.get(url)
+    print(':: balance request status - %d' % r.status_code)
+    if r.status_code == 200:
+        balance = r.json()['balance'] / 100
+        return balance
+    return -1
+
+def get_update_balance(wallet_address):
+    now = time.time()
+    if wallet_address in wallet_balances:
+        timestamp, balance = wallet_balances[wallet_address]
+        # check if balance has expired
+        if now - timestamp > 60 * 10:
+            # update balance and timestamp
+            balance = get_balance(wallet_address)
+            wallet_balances[wallet_address] = (now, balance)
+            # return new balance
+            return balance
+        else:
+            # return cached balance
+            return balance
+    else:
+        # initial balance and timestamp
+        balance = get_balance(wallet_address)
+        wallet_balances[wallet_address] = (now, balance)
+        # return initial balance
+        return balance
