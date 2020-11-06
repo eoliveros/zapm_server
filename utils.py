@@ -15,6 +15,8 @@ from flask import make_response
 from stdnum.nz import bankaccount
 import bnz_ib4b
 
+from app_core import app
+
 def generate_key(num=20):
     return binascii.hexlify(os.urandom(num)).decode()
 
