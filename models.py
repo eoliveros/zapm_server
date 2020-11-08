@@ -68,6 +68,7 @@ class User(db.Model, UserMixin):
     merchant_rate = db.Column(db.Numeric)
     customer_rate = db.Column(db.Numeric)
     wallet_address = db.Column(db.String(255))
+    created_date = db.Column(db.DateTime())
 
     def __init__(self, **kwargs):
         self.merchant_code = generate_key(4)
@@ -78,6 +79,7 @@ class User(db.Model, UserMixin):
         self.password = encrypt_password(generate_random_password(16))
         self.confirmed_at = datetime.datetime.now()
         self.active = True
+        self.created_date = self.confirmed_at
 
     @classmethod
     def from_email(cls, session, email):
@@ -626,7 +628,7 @@ class UserModelView(RestrictedModelView):
             msg.html = 'Thank you {}. <br/><br/><p>Please click <a href="{}/admin/reset">reset</a> and enter the registered email to reset your password.</p>'.format(model.merchant_name, app.config["SITE_URL"])
             mail.send(msg)
 
-    column_list = ['merchant_name', 'merchant_code', 'email', 'roles', 'max_settlements_per_month', 'settlement_fee', 'merchant_rate', 'customer_rate', 'wallet_address', 'wallet_balance']
+    column_list = ['merchant_name', 'merchant_code', 'created_date', 'email', 'roles', 'max_settlements_per_month', 'settlement_fee', 'merchant_rate', 'customer_rate', 'wallet_address', 'wallet_balance']
     column_formatters = dict(wallet_balance=_format_get_wallet_balance)
     form_args = dict(
         email=dict(validators=[DataRequired(), validate_email_address]),
