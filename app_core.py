@@ -21,7 +21,7 @@ else:
     app.config["SQLALCHEMY_ECHO"] = False
 app.config["TESTNET"] = True
 app.config["ASSET_ID"] = "CgUrFtinLXEbJwJVjwwcppk4Vpz1nMmR3H5cQaDcUcfe"
-app.config["NODE_ADDRESS"] = "http://testnodes.wavesnodes.com"
+app.config["NODE_ADDRESS"] = "http://testnode1.wavesnodes.com"
 if os.getenv("PRODUCTION"):
     app.config["TESTNET"] = False
     app.config["ASSET_ID"] = "9R3iLi4qGLVWKc16Tg98gmRvgg1usGEYd7SgC1W5D6HB"
