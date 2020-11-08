@@ -879,7 +879,7 @@ class MerchantTxModelView(BaseOnlyUserOwnedModelView):
 
 class BankModelView(BaseOnlyUserOwnedModelView):
     can_create = True
-    can_delete = False
+    can_delete = True
     can_edit = False
     can_export = True
     column_exclude_list = ['user', 'token', 'settlements']
