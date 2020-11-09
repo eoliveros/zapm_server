@@ -960,3 +960,4 @@ class SettlementModelView(BaseOnlyUserOwnedModelView):
 
     column_formatters = dict(amount=_format_amount, amount_receive=_format_amount)
     column_labels = dict(amount='ZAP Amount', amount_receive='NZD Amount')
+
