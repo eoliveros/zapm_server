@@ -523,6 +523,13 @@ def _format_get_wallet_balance(view, context, model, name):
         zap_balance = get_balance(wallet_address)
         return Markup(zap_balance)
 
+def _format_status(view, context, model, name):
+    if model.active:
+        status = 'Active'
+    else:
+        status = 'Inactive'
+    return Markup(status)
+
 class ReloadingIterator:
     def __init__(self, iterator_factory):
         self.iterator_factory = iterator_factory
@@ -628,8 +635,8 @@ class UserModelView(RestrictedModelView):
             msg.html = 'Thank you {}. <br/><br/><p>Please click <a href="{}/admin/reset">reset</a> and enter the registered email to reset your password.</p>'.format(model.merchant_name, app.config["SITE_URL"])
             mail.send(msg)
 
-    column_list = ['merchant_name', 'merchant_code', 'created_date', 'email', 'roles', 'max_settlements_per_month', 'settlement_fee', 'merchant_rate', 'customer_rate', 'wallet_address', 'wallet_balance']
-    column_formatters = dict(wallet_balance=_format_get_wallet_balance)
+    column_list = ['merchant_name', 'merchant_code', 'created_date', 'email', 'roles', 'max_settlements_per_month', 'settlement_fee', 'merchant_rate', 'customer_rate', 'wallet_address', 'wallet_balance', 'status']
+    column_formatters = dict(wallet_balance=_format_get_wallet_balance, status=_format_status)
     form_args = dict(
         email=dict(validators=[DataRequired(), validate_email_address]),
         merchant_name=dict(validators=[DataRequired()])
