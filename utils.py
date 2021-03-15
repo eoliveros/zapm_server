@@ -10,9 +10,17 @@ import secrets
 
 import requests
 import base58
+import pywaves
 from flask import make_response
+from flask import url_for
 from stdnum.nz import bankaccount
 import bnz_ib4b
+import qrcode
+import qrcode.image.svg
+from sendgrid import SendGridAPIClient
+from sendgrid.helpers.mail import Mail, From
+
+from app_core import app
 
 def generate_key(num=20):
     return binascii.hexlify(os.urandom(num)).decode()
@@ -133,3 +141,60 @@ def generate_random_password(length):
     password_characters = string.ascii_letters + string.digits + string.punctuation
     secret_password = ''.join(secrets.choice(password_characters) for i in range(length))
     return secret_password
+
+def is_address(s):
+    NODE_BASE_URL = app.config["NODE_ADDRESS"]
+    pywaves.setNode(NODE_BASE_URL, app.config["NODE_BASE_ENV"])
+    pywaves.setChain(app.config["NODE_BASE_ENV"])
+
+    try:
+       return pywaves.validateAddress(s)
+    except:
+       return False
+
+def is_mobile(s):
+    return s.isnumeric()
+
+def send_email(logger, subject, msg, to=None):
+    if not to:
+        to = app.config["ADMIN_EMAIL"]
+    from_email = From(app.config["FROM_EMAIL"], app.config["FROM_NAME"])
+    message = Mail(from_email=from_email, to_emails=to, subject=subject, html_content=msg)
+    try:
+        sg = SendGridAPIClient(app.config["MAIL_SENDGRID_API_KEY"])
+        response = sg.send(message)
+    except Exception as ex:
+        logger.error(f"email '{subject}': {ex}")
+
+def email_payment_claim(logger, payment, hours_expiry):
+    url = url_for("claim_payment", token=payment.token, _external=True)
+    msg = f"You have a ZAP payment waiting!<br/><br/>Claim your payment <a href='{url}'>here</a><br/><br/>Claim within {hours_expiry} hours"
+    send_email(logger, "Claim your ZAP payment", msg, payment.email)
+
+def sms_payment_claim(logger, payment, hours_expiry):
+    # SMS messages are sent by burst SMS
+    #  - the authorization is by the sender email
+    #  - the country code is configured by the account
+    url = url_for("claim_payment", token=payment.token, _external=True)
+    msg = f"You have a ZAP payment waiting! Claim your payment (within {hours_expiry} hours) {url}"
+    email = str(payment.mobile) + "@transmitsms.com"
+    send_email(logger, "ZAP Payment", msg, email)
+
+def qrcode_svg_create(data, box_size=10):
+    factory = qrcode.image.svg.SvgPathImage
+    img = qrcode.make(data, image_factory=factory, box_size=box_size)
+    output = io.BytesIO()
+    img.save(output)
+    svg = output.getvalue().decode('utf-8')
+    return svg
+
+
+
+def generate_wallet_address(wallet_seed):
+    wallet_addr = None
+    if wallet_seed:
+        NODE_BASE_URL = app.config["NODE_ADDRESS"]
+        pywaves.setNode(NODE_BASE_URL, app.config["NODE_BASE_ENV"])
+        wallet_addr = pywaves.Address(seed='{}'.format(wallet_seed))
+        return wallet_addr.address
+    return wallet_addr

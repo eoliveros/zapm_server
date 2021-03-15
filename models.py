@@ -5,18 +5,20 @@ import logging
 import io
 import json
 from urllib.parse import urlparse
+import time
 
 from flask import redirect, url_for, request, abort, flash, has_app_context, g
 from flask_admin import expose
 from flask_admin.actions import action
 from flask_admin.babel import lazy_gettext
 from flask_admin.helpers import get_form_data
-from flask_admin.model import filters
+from flask_admin.model import filters, typefmt
 from flask_admin.contrib import sqla
 from flask_mail import Message
 from sqlalchemy import and_
 from flask_admin.contrib.sqla.filters import BaseSQLAFilter
-from wtforms import ValidationError
+from wtforms import ValidationError, validators
+from wtforms.fields import TextField, DecimalField, FileField
 from flask_security import Security, SQLAlchemyUserDatastore, \
     UserMixin, RoleMixin, login_required, current_user
 from flask_security.utils import encrypt_password
@@ -27,9 +29,10 @@ import base58
 import qrcode
 import qrcode.image.svg
 from wtforms.validators import DataRequired
+import pywaves
 
 from app_core import app, db, aw, mail
-from utils import generate_key, ib4b_response, bankaccount_is_valid, blockchain_transactions, apply_merchant_rate, is_email, generate_random_password
+from utils import generate_key, ib4b_response, bankaccount_is_valid, blockchain_transactions, apply_merchant_rate, is_email, generate_random_password, is_address, is_mobile, generate_wallet_address 
 
 logger = logging.getLogger(__name__)
 
@@ -90,6 +93,33 @@ class User(db.Model, UserMixin):
 
     def __str__(self):
         return '%s (%s)' % (self.merchant_code, self.merchant_name)
+
+class Seeds(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    user_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False)
+    user = db.relationship('User', backref=db.backref('wallet_seeds', lazy='dynamic'))
+    wallet_seed = db.Column(db.String(255), nullable=False)
+    wallet_address = db.Column(db.String(255))
+
+    settlement_fee = db.Column(db.Numeric)
+    merchant_rate = db.Column(db.Numeric)
+    customer_rate = db.Column(db.Numeric)
+
+    def __init__(self, user, wallet_seed, wallet_address, settlement_fee, merchant_rate, customer_rate):
+        self.user = user
+        self.wallet_seed = wallet_seed
+        self.wallet_address = wallet_address
+        self.settlement_fee = settlement_fee
+        self.merchant_rate = merchant_rate 
+        self.customer_rate = customer_rate
+        self.generate_defaults()
+
+    def generate_defaults(self):
+        self.user = current_user
+        self.wallet_address = generate_wallet_address(self.wallet_seed)
+
+    def __repr__(self):
+        return self.wallet_seed
 
 class BankSchema(Schema):
     token = fields.String()
@@ -339,6 +369,116 @@ class MerchantTx(db.Model):
         schema = MerchantTxSchema()
         return schema.dump(self).data
 
+class Payment(db.Model):
+    STATE_CREATED = "created"
+    STATE_SENT_CLAIM_LINK = "sent_claim_link"
+    STATE_EXPIRED = "expired"
+    STATE_SENT_FUNDS = "sent_funds"
+
+    id = db.Column(db.Integer, primary_key=True)
+    proposal_id = db.Column(db.Integer, db.ForeignKey('proposal.id'), nullable=False)
+    proposal = db.relationship('Proposal', backref=db.backref('payments', lazy='dynamic'))
+    token = db.Column(db.String(255), unique=True, nullable=False)
+    mobile = db.Column(db.String(255))
+    email = db.Column(db.String(255))
+    wallet_address = db.Column(db.String(255))
+    message = db.Column(db.String())
+    amount = db.Column(db.Integer)
+    status = db.Column(db.String(255))
+    txid = db.Column(db.String(255))
+
+    def __init__(self, proposal, mobile, email, wallet_address, message, amount):
+        self.proposal = proposal
+        self.token = generate_key(8)
+        self.mobile = mobile
+        self.email = email
+        self.wallet_address = wallet_address
+        self.message = message
+        self.amount = amount
+        self.status = self.STATE_CREATED
+        self.txid = None
+
+    @classmethod
+    def count(cls, session):
+        return session.query(cls).count()
+
+    @classmethod
+    def from_token(cls, session, token):
+        return session.query(cls).filter(cls.token == token).first()
+
+    def __repr__(self):
+        return "<Payment %r>" % (self.token)
+
+categories_proposals = db.Table(
+    'categories_proposals',
+    db.Column('proposal_id', db.Integer(), db.ForeignKey('proposal.id')),
+    db.Column('category_id', db.Integer(), db.ForeignKey('category.id'))
+)
+
+class Category(db.Model):
+    id = db.Column(db.Integer(), primary_key=True)
+    name = db.Column(db.String(80), unique=True)
+    description = db.Column(db.String(255))
+
+    @classmethod
+    def from_name(cls, session, name):
+        return session.query(cls).filter(cls.name == name).first()
+
+    def __str__(self):
+        return self.name
+
+class Proposal(db.Model):
+    STATE_CREATED = "created"
+    STATE_AUTHORIZED = "authorized"
+    STATE_DECLINED = "declined"
+    STATE_EXPIRED = "expired"
+
+    HOURS_EXPIRY = 72
+
+    id = db.Column(db.Integer, primary_key=True)
+    date = db.Column(db.DateTime(), nullable=False)
+    user_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False)
+    user = db.relationship('User', foreign_keys=[user_id], backref=db.backref('proposals_user', lazy='dynamic'))
+    proposer_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False)
+    proposer = db.relationship('User', foreign_keys=[proposer_id], backref=db.backref('proposals_proposed', lazy='dynamic'))
+    reason = db.Column(db.String())
+    authorizer_id = db.Column(db.Integer, db.ForeignKey('user.id'))
+    authorizer = db.relationship('User', foreign_keys=[authorizer_id], backref=db.backref('proposals_authorized', lazy='dynamic'))
+    merchant_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False)
+    merchant = db.relationship('User', foreign_keys=[merchant_id], backref=db.backref('proposals_merchants', lazy='dynamic'))
+    date_authorized = db.Column(db.DateTime())
+    date_expiry = db.Column(db.DateTime())
+    status = db.Column(db.String(255))
+    categories = db.relationship('Category', secondary=categories_proposals,
+    backref=db.backref('proposals', lazy='dynamic'))
+
+    def __init__(self, proposer, merchant, reason):
+        self.generate_defaults()
+        self.proposer= proposer
+        self.merchant = merchant
+        self.reason = reason
+
+    def generate_defaults(self):
+        self.date = datetime.datetime.now()
+        self.proposer = current_user
+        self.merchant = current_user
+        self.user = current_user
+        self.authorizer = None
+        self.date_authorized = None
+        self.date_expiry = None
+        self.status = self.STATE_CREATED
+
+    @classmethod
+    def count(cls, session):
+        return session.query(cls).count()
+
+    @classmethod
+    def in_status(cls, session, status):
+        return session.query(cls).filter(cls.status == status).all()
+
+    def __repr__(self):
+        return "<Proposal %r>" % (self.id)
+
 class SettlementSchema(Schema):
     date = fields.Float()
     token = fields.String()
@@ -419,6 +559,82 @@ class Settlement(db.Model):
         schema = SettlementSchema()
         return schema.dump(self).data
 
+class WavesTxSchema(Schema):
+    date = fields.Date()
+    txid = fields.String()
+    type = fields.String()
+    state = fields.String()
+    amount = fields.Integer()
+    json_data_signed = fields.Boolean()
+    json_data = fields.String()
+
+class WavesTx(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    date = db.Column(db.Integer, nullable=False)
+    txid = db.Column(db.String, nullable=False, unique=True)
+    type = db.Column(db.String, nullable=False)
+    state = db.Column(db.String, nullable=False)
+    amount = db.Column(db.Integer, nullable=False)
+    json_data_signed = db.Column(db.Boolean, nullable=False)
+    json_data = db.Column(db.String, nullable=False)
+
+    def __init__(self, txid, type, state, amount, json_data_signed, json_data):
+        self.date = time.time()
+        self.type = type
+        self.state = state
+        self.txid = txid
+        self.amount = amount
+        self.json_data_signed = json_data_signed
+        self.json_data = json_data
+
+    @classmethod
+    def from_txid(cls, session, txid):
+        return session.query(cls).filter(cls.txid == txid).first()
+
+    @classmethod
+    def expire_transactions(cls, session, above_age, from_state, to_state):
+        now = time.time()
+        txs = session.query(cls).filter(cls.date < now - above_age, cls.state == from_state).all()
+        for tx in txs:
+            tx.state = to_state
+            tx.json_data = ""
+            session.add(tx)
+        return len(txs)
+
+    @classmethod
+    def count(cls, session):
+        return session.query(cls).count()
+
+    def __repr__(self):
+        return '<WavesTx %r>' % (self.txid)
+
+    def to_json(self):
+        tx_schema = WavesTxSchema()
+        return tx_schema.dump(self).data
+
+    def tx_with_sigs(self):
+        tx = json.loads(self.json_data)
+        if self.json_data_signed:
+            return tx
+        proofs = tx["proofs"]
+        for sig in self.signatures:
+            while sig.signer_index >= len(proofs):
+                proofs.append('todo')
+            proofs[sig.signer_index] = sig.value
+        return tx
+
+class WavesTxSig(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    waves_tx_id = db.Column(db.Integer, db.ForeignKey('waves_tx.id'), nullable=False)
+    waves_tx = db.relationship('WavesTx', backref=db.backref('signatures', lazy='dynamic'))
+    signer_index = db.Column(db.Integer, nullable=False)
+    value = db.Column(db.String, unique=False)
+
+    def __init__(self, waves_tx, signer_index, value):
+        self.waves_tx = waves_tx
+        self.signer_index = signer_index
+        self.value = value
+
 #
 # Setup Flask-Security-Too
 #
@@ -429,6 +645,14 @@ security = Security(app, user_datastore)
 #
 # Define model views
 #
+
+def date_format(view, value):
+    return value.strftime('%Y.%m.%d %H:%M')
+
+MY_DEFAULT_FORMATTERS = dict(typefmt.BASE_FORMATTERS)
+MY_DEFAULT_FORMATTERS.update({
+    datetime.date: date_format,
+})
 
 class DateBetweenFilter(BaseSQLAFilter, filters.BaseDateBetweenFilter):
     def __init__(self, column, name, options=None, data_type=None):
@@ -550,6 +774,15 @@ def _format_direction(view, context, model, name):
     elif model.direction == 1:
         return Markup('in')
 
+def format_rebate_address(view, context, model, name):
+    NODE_BASE_URL = app.config["NODE_ADDRESS"]
+    pywaves.setNode(NODE_BASE_URL, app.config["NODE_BASE_ENV"])
+    pywaves.setChain(app.config["NODE_BASE_ENV"])
+    if model.wallet_seed:
+        rebate_addr = pywaves.Address(seed='{}'.format(model.wallet_seed))
+        return rebate_addr.address
+    return False
+
 class ReloadingIterator:
     def __init__(self, iterator_factory):
         self.iterator_factory = iterator_factory
@@ -638,6 +871,38 @@ class RestrictedModelView(BaseModelView):
                 current_user.is_authenticated and
                 self.check_roles())
 
+def validate_recipient(recipient):
+    if not recipient or \
+       (not is_email(recipient) and not is_mobile(recipient) and not is_address(recipient)):
+       return False
+    ##TODO: direct wallet address not yet implemented
+    if is_address(recipient):
+        return False
+    return True
+
+def validate_csv(data):
+    rows = []
+    try:
+        data = data.decode('utf-8')
+    except:
+        return False
+    data = data.splitlines()
+    reader = csv.reader(data)
+    for row in reader:
+        if len(row) != 3:
+            return False
+        recipient, message, amount = row
+        if not validate_recipient(recipient):
+            return False
+        try:
+            amount = decimal.Decimal(amount)
+        except ValueError:
+            return False
+        if amount <= 0:
+            return False
+        rows.append((recipient, message, amount))
+    return rows
+
 class UserModelView(RestrictedModelView):
     can_create = False
     can_delete = False
@@ -656,31 +921,37 @@ class UserModelView(RestrictedModelView):
             send_reset_password_instructions(model)
 
     def _format_information_column(view, context, model, name):
-        if not model.wallet_address:
-            return ''
-        node_url = app.config["NODE_ADDRESS"]
-        asset_id = app.config["ASSET_ID"]
-        explorer_url = app.config["BLOCKCHAIN_EXPLORER"]
-        html = '''
-            wallet address: <a href="{explorer_url}/address/{address}/tx">{address}</a>
-            wallet balance:
-            <span id="{address}-balance"></span>
-            <script>
-                var xhr = new XMLHttpRequest();
-                var url = "{node_url}/assets/balance/{address}/{asset_id}";
-                xhr.onreadystatechange = function() {{
-                    if (this.readyState == 4 && this.status == 200) {{
-                        var json = JSON.parse(this.responseText);
-                        var bal = (json.balance / 100).toFixed(2);
-                        document.getElementById("{address}-balance").textContent = bal + ' ZAP';
-                    }}
-                }};
-                xhr.open("GET", url, true);
-                xhr.send();
-            </script><br/>
-            bank account number: {bank_account_number}
-        '''.format(address=model.wallet_address, node_url=node_url, asset_id=asset_id, explorer_url=explorer_url, bank_account_number=model.banks.first())
-        return Markup(html)
+        for seed_wallet, in db.session.query(Seeds.wallet_seed).filter(Seeds.user_id == model.id):
+            if not seed_wallet:
+        #if not seed_wallet:
+            #return ''
+                return ''
+            NODE_BASE_URL = app.config["NODE_ADDRESS"]
+            pywaves.setNode(NODE_BASE_URL, app.config["NODE_BASE_ENV"])
+            rebate_addr = pywaves.Address(seed='{}'.format(seed_wallet))
+            node_url = app.config["NODE_ADDRESS"]
+            asset_id = app.config["ASSET_ID"]
+            explorer_url = app.config["BLOCKCHAIN_EXPLORER"]
+            html = '''
+                wallet address: <a href="{explorer_url}/address/{address}/tx">{address}</a>
+                wallet balance:
+                <span id="{address}-balance"></span>
+                <script>
+                    var xhr = new XMLHttpRequest();
+                    var url = "{node_url}/assets/balance/{address}/{asset_id}";
+                    xhr.onreadystatechange = function() {{
+                        if (this.readyState == 4 && this.status == 200) {{
+                            var json = JSON.parse(this.responseText);
+                            var bal = (json.balance / 100).toFixed(2);
+                            document.getElementById("{address}-balance").textContent = bal + ' ZAP';
+                        }}
+                    }};
+                    xhr.open("GET", url, true);
+                    xhr.send();
+                </script><br/>
+                bank account number: {bank_account_number}
+            '''.format(address=rebate_addr.address, node_url=node_url, asset_id=asset_id, explorer_url=explorer_url, bank_account_number=model.banks.first())
+            return Markup(html)
 
     def _format_address_column_export(view, context, model, name):
         if not model.wallet_address:
@@ -693,7 +964,22 @@ class UserModelView(RestrictedModelView):
             return Markup(bank_account_number)
         return Markup('-')
 
-    column_list = ['merchant_name', 'email', 'roles', 'active', 'max_settlements_per_month', 'settlement_fee', 'merchant_rate', 'customer_rate', 'information']
+    def _get_wallet_seed(view, context, model, name):
+        NODE_BASE_URL = app.config["NODE_ADDRESS"]
+        pywaves.setNode(NODE_BASE_URL, app.config["NODE_BASE_ENV"])
+        for seed_wallet, in db.session.query(Seeds.wallet_seed).filter(Seeds.user_id == model.id):
+            return seed_wallet
+
+    def _get_wallet_addr(view, context, model, name):
+        NODE_BASE_URL = app.config["NODE_ADDRESS"]
+        pywaves.setNode(NODE_BASE_URL, app.config["NODE_BASE_ENV"])
+        for seed_wallet, in db.session.query(Seeds.wallet_seed).filter(Seeds.user_id == model.id):
+            if seed_wallet:
+                rebate_addr = pywaves.Address(seed='{}'.format(seed_wallet))
+                return rebate_addr.address
+            return False 
+
+    column_list = ['merchant_name', 'email', 'roles', 'active', 'max_settlements_per_month', 'settlement_fee', 'merchant_rate', 'customer_rate', 'wallet_address', 'information']
     column_formatters = dict(information=_format_information_column, bank_account_number=_format_bank_account)
     column_filters = [ FilterStartsWithInsensitive(User.merchant_name, 'Search Merchant Name'), FilterStartsWithInsensitive(User.email, 'Search Email'), FilterBoolean(User.active, 'Filter Active') ]
     column_labels = {'bank_account_number': 'Bank AccountNumber(Active)'}
@@ -712,7 +998,9 @@ class AdminUserModelView(UserModelView):
     def is_accessible(self):
         return (current_user.has_role('admin'))
 
-    column_editable_list = ['merchant_name', 'roles', 'max_settlements_per_month', 'settlement_fee', 'merchant_rate', 'customer_rate', 'active']
+    #column_editable_list = ['merchant_name', 'roles', 'max_settlements_per_month', 'settlement_fee', 'merchant_rate', 'customer_rate', 'active']
+    #column_editable_list = ['merchant_name', 'roles', 'max_settlements_per_month', 'settlement_fee', 'active']
+    column_editable_list = ['merchant_name', 'roles', 'max_settlements_per_month', 'active']
     form_columns = ['roles', 'merchant_name', 'email']
 
 class FinanceUserModelView(UserModelView):
@@ -722,7 +1010,8 @@ class FinanceUserModelView(UserModelView):
     def is_accessible(self):
         return (current_user.has_role('finance'))
 
-    column_editable_list = ['merchant_name', 'max_settlements_per_month', 'settlement_fee', 'merchant_rate', 'customer_rate', 'active']
+    #column_editable_list = ['merchant_name', 'max_settlements_per_month', 'settlement_fee', 'merchant_rate', 'customer_rate', 'active']
+    column_editable_list = ['merchant_name', 'max_settlements_per_month', 'active']
     form_columns = ['merchant_name', 'email']
 
 class BankAdminModelView(RestrictedModelView):
@@ -950,6 +1239,23 @@ class MerchantTxModelView(BaseOnlyUserOwnedModelView):
             flash('Updated')
         return redirect('./')
 
+    def _add_rebate():
+        customer_rate = user.customer_rate / 100 if user.customer_rate else app.config["CUSTOMER_RATE"]
+        merchant_rate = user.merchant_rate / 100 if user.merchant_rate else app.config["MERCHANT_RATE"]
+        amount = amount * (merchant_rate / 100)
+        email = recipient if is_email(recipient) else None
+        mobile = recipient if is_mobile(recipient) else None
+        address = recipient if is_address(recipient) else None
+        message = "You can claim a payment of {} Zap".format(amount)
+        #payment = Payment(model, mobile, email, address, message, amount)
+        #self.session.add(payment)
+        return "this is a test"
+
+    def after_model_change(self, form, model, is_created):
+        test = self._add_rebate()
+        print(test)
+        logger.info(test)
+
 class BankModelView(BaseOnlyUserOwnedModelView):
     can_create = True
     can_delete = False
@@ -1033,3 +1339,576 @@ class SettlementModelView(BaseOnlyUserOwnedModelView):
 
     column_formatters = dict(amount=_format_amount, amount_receive=_format_amount)
     column_labels = dict(amount='ZAP Amount', amount_receive='NZD Amount')
+
+class ProposalUserModelView(BaseOnlyUserOwnedModelView):
+    can_create = False
+    can_delete = False
+    can_edit = False
+    can_export = True
+
+    def _format_proposer_column(view, context, model, name):
+        if name == 'proposer':
+            if not model.proposer:
+                return ''
+            email = model.proposer.email
+        elif name == 'authorizer':
+            if not model.authorizer:
+                return ''
+            email = model.authorizer.email
+        else:
+            raise Exception('invalid column')
+        name = email.split("@")[0]
+        html = '<span title="{email}">{name}</span>'.format(email=email, name=name)
+        return Markup(html)
+
+    def _format_status_column(view, context, model, name):
+        if model.status in (model.STATE_AUTHORIZED, model.STATE_DECLINED, model.STATE_EXPIRED):
+            return model.status
+        if current_user.has_role('admin') or current_user.has_role('finance') or current_user.has_role('merchant'):
+            authorize_url = url_for('.authorize_view')
+            decline_url = url_for('.decline_view')
+            html = '''
+                <form action="{authorize_url}" method="POST">
+                    <input id="proposal_id" name="proposal_id"  type="hidden" value="{proposal_id}">
+                    <button type='submit'>Authorise</button>
+                </form>
+                <form action="{decline_url}" method="POST">
+                    <input id="proposal_id" name="proposal_id"  type="hidden" value="{proposal_id}">
+                    <button type='submit'>Decline</button>
+                </form>
+            '''.format(authorize_url=authorize_url, decline_url=decline_url, proposal_id=model.id)
+            return Markup(html)
+        return model.status
+
+    def _format_claimed(view, model):
+        if model.status == model.STATE_DECLINED:
+            return '-'
+        total_claimed = 0
+        for payment in model.payments:
+            if payment.status == payment.STATE_SENT_FUNDS:
+                total_claimed += payment.amount
+        total_claimed = decimal.Decimal(total_claimed) / 100
+        return total_claimed
+
+    def _format_claimed_column(view, context, model, name):
+        total_claimed = view._format_claimed(model)
+        payments_url = url_for('.payments_view', proposal_id=model.id)
+
+        html = '''
+            <a href="{payments_url}">{total_claimed}</a>
+        '''.format(payments_url=payments_url, total_claimed=total_claimed)
+        return Markup(html)
+
+    def _format_total_column(view, context, model, name):
+        if model.status == model.STATE_DECLINED:
+            return Markup('-')
+        total = 0
+        for payment in model.payments:
+            total += payment.amount
+        total = total / 100
+        return Markup(total)
+
+    def _format_totalclaimed_column_export(view, context, model, name):
+        total_claimed = view._format_claimed(model)
+        return Markup(total_claimed)
+
+    column_default_sort = ('id', True)
+    column_list = ('id', 'date', 'proposer', 'categories', 'authorizer', 'reason', 'date_authorized', 'date_expiry', 'status', 'Proposed Total', 'Claimed')
+    column_labels = {'proposer': 'Proposed by', 'authorizer': 'Authorized by'}
+    column_type_formatters = MY_DEFAULT_FORMATTERS
+    column_formatters = {'proposer': _format_proposer_column, 'authorizer': _format_proposer_column, 'status': _format_status_column, 'Proposed Total': _format_total_column, 'Claimed': _format_claimed_column}
+    #column_filters = [ DateBetweenFilter(Proposal.date, 'Search Date'), DateTimeGreaterFilter(Proposal.date, 'Search Date'), DateSmallerFilter(Proposal.date, 'Search Date'), FilterByStatusEqual(None, 'Search Status'), FilterByStatusNotEqual(None, 'Search Status'), FilterByProposer(None, 'Search Proposer'), FilterByAuthorizer(None, 'Search Authorizer'), FilterByCategory(None, 'Search Category') ]
+    column_export_list = ('id', 'date', 'merchant', 'proposer', 'categories', 'authorizer', 'reason', 'date_authorized', 'date_expiry', 'status', 'total', 'claimed')
+    column_formatters_export = {'total': _format_total_column, 'claimed': _format_totalclaimed_column_export}
+    form_columns = ['reason', 'categories', 'recipient', 'message', 'amount', 'csvfile']
+    form_extra_fields = {'recipient': TextField('Recipient'), 'message': TextField('Message'), 'amount': DecimalField('Amount', validators=[validators.Optional()]), 'csvfile': FileField('CSV File')}
+
+    def _validate_form(self, form):
+        csv_rows = None
+        if not form.reason.data:
+            return False, "Empty reason value", csv_rows
+        # do csv file first
+        if form.csvfile.data:
+            csv_rows = validate_csv(form.csvfile.data.stream.read())
+            if not csv_rows:
+                return False, "Invalid CSV file", csv_rows
+        else:
+            # if not csv file then do other:
+            if not validate_recipient(form.recipient.data):
+                return False, "Recipient is invalid", csv_rows
+            if not form.amount.data or form.amount.data <= 0:
+                return False, "Amount must be greater then 0", csv_rows
+        return True, "", csv_rows
+
+    def _add_payment(self, model, recipient, message, amount):
+        email = recipient if is_email(recipient) else None
+        mobile = recipient if is_mobile(recipient) else None
+        address = recipient if is_address(recipient) else None
+        amount = int(amount * 100)
+        payment = Payment(model, mobile, email, address, message, amount)
+        self.session.add(payment)
+
+    def on_model_change(self, form, model, is_created):
+        if is_created:
+            # validate
+            res, msg, csv_rows = self._validate_form(form)
+            if not res:
+                raise validators.ValidationError(msg)
+            # generate model defaults
+            model.generate_defaults()
+            # check csv file first
+            if form.csvfile.data:
+                for recipient, message, amount in csv_rows:
+                    self._add_payment(model, recipient, message, amount)
+            # or just process basic fields
+            else:
+                recipient = form.recipient.data
+                message = form.message.data
+                amount = form.amount.data
+                self._add_payment(model, recipient, message, amount)
+
+    def is_accessible(self):
+        if not (current_user.is_active and current_user.is_authenticated):
+            return False
+        if current_user.has_role('admin'):
+            self.can_create = True
+            return True
+        if current_user.has_role('finance'):
+            self.can_create = True
+            return True
+        if current_user.has_role('merchant'):
+            self.can_create = True
+            return True
+        return False
+
+    @expose('authorize', methods=['POST'])
+    def authorize_view(self):
+        return_url = self.get_url('.index_view')
+        # check permission
+        if not (current_user.has_role('admin') or current_user.has_role('finance') or current_user.has_role('merchant')):
+            # permission denied
+            flash('Not authorized.', 'error')
+            return redirect(return_url)
+        # get the model from the database
+        form = get_form_data()
+        if not form:
+            flash('Could not get form data.', 'error')
+            return redirect(return_url)
+        proposal_id = form['proposal_id']
+        proposal = self.get_one(proposal_id)
+        if proposal is None:
+            flash('Proposal not not found.', 'error')
+            return redirect(return_url)
+        # process the proposal
+        if proposal.status == proposal.STATE_CREATED:
+            proposal.status = proposal.STATE_AUTHORIZED
+            now = datetime.datetime.now()
+            proposal.date_authorized = now
+            proposal.date_expiry = now + datetime.timedelta(hours = Proposal.HOURS_EXPIRY)
+            proposal.authorizer = current_user
+
+        # commit to db
+        try:
+            self.session.commit()
+            flash('Proposal {proposal_id} set as authorized'.format(proposal_id=proposal_id))
+        except Exception as ex:
+            if not self.handle_view_exception(ex):
+                raise
+            flash('Failed to set proposal {proposal_id} as authorized'.format(proposal_id=proposal_id), 'error')
+        return redirect(return_url)
+
+    @expose('decline', methods=['POST'])
+    def decline_view(self):
+        return_url = self.get_url('.index_view')
+        # check permission
+        if not (current_user.has_role('admin') or current_user.has_role('finance') or current_user.has_role('merchant')):
+            # permission denied
+            flash('Not authorized.', 'error')
+            return redirect(return_url)
+        # get the model from the database
+        form = get_form_data()
+        if not form:
+            flash('Could not get form data.', 'error')
+            return redirect(return_url)
+        proposal_id = form['proposal_id']
+        proposal = self.get_one(proposal_id)
+        if proposal is None:
+            flash('Proposal not not found.', 'error')
+            return redirect(return_url)
+        # process the proposal
+        if proposal.status == proposal.STATE_CREATED:
+            proposal.status = proposal.STATE_DECLINED
+            proposal.authorizer = current_user
+        # commit to db
+        try:
+            self.session.commit()
+            flash('Proposal {proposal_id} set as declined'.format(proposal_id=proposal_id))
+        except Exception as ex:
+            if not self.handle_view_exception(ex):
+                raise
+            flash('Failed to set proposal {proposal_id} as declined'.format(proposal_id=proposal_id), 'error')
+        return redirect(return_url)
+
+    @expose('payments/<proposal_id>', methods=['GET'])
+    def payments_view(self, proposal_id):
+        return_url = self.get_url('.index_view')
+        # check permission
+        if not (current_user.has_role('admin') or current_user.has_role('finance') or current_user.has_role('merchant')):
+            # permission denied
+            flash('Not authorized.', 'error')
+            return redirect(return_url)
+        # get the model from the database
+        proposal = self.get_one(proposal_id)
+        if proposal is None:
+            flash('Proposal not not found.', 'error')
+            return redirect(return_url)
+        # show the proposal payments
+        return self.render('admin/payments.html', payments=proposal.payments)
+
+class SeedsUserModelView(BaseOnlyUserOwnedModelView):
+    can_create = True
+    can_delete = True
+    can_edit = False
+    can_export = False
+
+    def on_model_change(self, form, model, is_created):
+        if is_created:
+            model.generate_defaults()
+
+    def after_model_change(self, form, model, is_created):
+        if is_created:
+            db.session.query(User).filter(User.id == model.user_id).update({User.wallet_address: model.wallet_address})
+        db.session.query(User).filter(User.id == model.user_id).update({User.settlement_fee: model.settlement_fee, User.customer_rate: model.customer_rate, User.merchant_rate: model.merchant_rate})
+        db.session.commit()
+
+    form_columns = ['wallet_seed']
+    column_editable_list = ['settlement_fee', 'merchant_rate', 'customer_rate']
+
+class SeedsAdminModelView(RestrictedModelView):
+    can_create = True
+    can_delete = True
+    can_edit = False
+    can_export = False
+
+    def on_model_change(self, form, model, is_created):
+        if is_created:
+            model.generate_defaults()
+
+    def after_model_change(self, form, model, is_created):
+        if is_created:
+            db.session.query(User).filter(User.id == model.user_id).update({User.wallet_address: model.wallet_address})
+        db.session.query(User).filter(User.id == model.user_id).update({User.settlement_fee: model.settlement_fee, User.customer_rate: model.customer_rate, User.merchant_rate: model.merchant_rate})
+        db.session.commit()
+
+    form_columns = ['wallet_seed']
+    column_editable_list = ['settlement_fee', 'merchant_rate', 'customer_rate']
+
+class ProposalAdminModelView(RestrictedModelView):
+    can_create = False
+    can_delete = False
+    can_edit = False
+    can_export = True
+
+    def _format_proposer_column(view, context, model, name):
+        if name == 'proposer':
+            if not model.proposer:
+                return ''
+            email = model.proposer.email
+        elif name == 'authorizer':
+            if not model.authorizer:
+                return ''
+            email = model.authorizer.email
+        else:
+            raise Exception('invalid column')
+        name = email.split("@")[0]
+        html = '<span title="{email}">{name}</span>'.format(email=email, name=name)
+        return Markup(html)
+
+    def _format_status_column(view, context, model, name):
+        if model.status in (model.STATE_AUTHORIZED, model.STATE_DECLINED, model.STATE_EXPIRED):
+            return model.status
+        if current_user.has_role('admin') or current_user.has_role('finance') or current_user.has_role('merchant'):
+            authorize_url = url_for('.authorize_view')
+            decline_url = url_for('.decline_view')
+            html = '''
+                <form action="{authorize_url}" method="POST">
+                    <input id="proposal_id" name="proposal_id"  type="hidden" value="{proposal_id}">
+                    <button type='submit'>Authorise</button>
+                </form>
+                <form action="{decline_url}" method="POST">
+                    <input id="proposal_id" name="proposal_id"  type="hidden" value="{proposal_id}">
+                    <button type='submit'>Decline</button>
+                </form>
+            '''.format(authorize_url=authorize_url, decline_url=decline_url, proposal_id=model.id)
+            return Markup(html)
+        return model.status
+
+    def _format_claimed(view, model):
+        if model.status == model.STATE_DECLINED:
+            return '-'
+        total_claimed = 0
+        for payment in model.payments:
+            if payment.status == payment.STATE_SENT_FUNDS:
+                total_claimed += payment.amount
+        total_claimed = decimal.Decimal(total_claimed) / 100
+        return total_claimed
+
+    def _format_claimed_column(view, context, model, name):
+        total_claimed = view._format_claimed(model)
+        payments_url = url_for('.payments_view', proposal_id=model.id)
+
+        html = '''
+            <a href="{payments_url}">{total_claimed}</a>
+        '''.format(payments_url=payments_url, total_claimed=total_claimed)
+        return Markup(html)
+
+    def _format_total_column(view, context, model, name):
+        if model.status == model.STATE_DECLINED:
+            return Markup('-')
+        total = 0
+        for payment in model.payments:
+            total += payment.amount
+        total = total / 100
+        return Markup(total)
+
+    def _format_totalclaimed_column_export(view, context, model, name):
+        total_claimed = view._format_claimed(model)
+        return Markup(total_claimed)
+
+    column_default_sort = ('id', True)
+    column_list = ('id', 'date', 'proposer', 'categories', 'authorizer', 'reason', 'date_authorized', 'date_expiry', 'status', 'Proposed Total', 'Claimed')
+    column_labels = {'proposer': 'Proposed by', 'authorizer': 'Authorized by'}
+    column_type_formatters = MY_DEFAULT_FORMATTERS
+    column_formatters = {'proposer': _format_proposer_column, 'authorizer': _format_proposer_column, 'status': _format_status_column, 'Proposed Total': _format_total_column, 'Claimed': _format_claimed_column}
+    #column_filters = [ DateBetweenFilter(Proposal.date, 'Search Date'), DateTimeGreaterFilter(Proposal.date, 'Search Date'), DateSmallerFilter(Proposal.date, 'Search Date'), FilterByStatusEqual(None, 'Search Status'), FilterByStatusNotEqual(None, 'Search Status'), FilterByProposer(None, 'Search Proposer'), FilterByAuthorizer(None, 'Search Authorizer'), FilterByCategory(None, 'Search Category') ]
+    column_export_list = ('id', 'date', 'merchant', 'proposer', 'categories', 'authorizer', 'reason', 'date_authorized', 'date_expiry', 'status', 'total', 'claimed')
+    column_formatters_export = {'total': _format_total_column, 'claimed': _format_totalclaimed_column_export}
+    form_columns = ['reason', 'categories', 'recipient', 'message', 'amount', 'csvfile']
+    form_extra_fields = {'recipient': TextField('Recipient'), 'message': TextField('Message'), 'amount': DecimalField('Amount', validators=[validators.Optional()]), 'csvfile': FileField('CSV File')}
+
+    def _validate_form(self, form):
+        csv_rows = None
+        if not form.reason.data:
+            return False, "Empty reason value", csv_rows
+        # do csv file first
+        if form.csvfile.data:
+            csv_rows = validate_csv(form.csvfile.data.stream.read())
+            if not csv_rows:
+                return False, "Invalid CSV file", csv_rows
+        else:
+            # if not csv file then do other:
+            if not validate_recipient(form.recipient.data):
+                return False, "Recipient is invalid", csv_rows
+            if not form.amount.data or form.amount.data <= 0:
+                return False, "Amount must be greater then 0", csv_rows
+        return True, "", csv_rows
+
+    def _add_payment(self, model, recipient, message, amount):
+        email = recipient if is_email(recipient) else None
+        mobile = recipient if is_mobile(recipient) else None
+        address = recipient if is_address(recipient) else None
+        amount = int(amount * 100)
+        payment = Payment(model, mobile, email, address, message, amount)
+        self.session.add(payment)
+
+    def on_model_change(self, form, model, is_created):
+        if is_created:
+            # validate
+            res, msg, csv_rows = self._validate_form(form)
+            if not res:
+                raise validators.ValidationError(msg)
+            # generate model defaults
+            model.generate_defaults()
+            # check csv file first
+            if form.csvfile.data:
+                for recipient, message, amount in csv_rows:
+                    self._add_payment(model, recipient, message, amount)
+            # or just process basic fields
+            else:
+                recipient = form.recipient.data
+                message = form.message.data
+                amount = form.amount.data
+                self._add_payment(model, recipient, message, amount)
+
+    def is_accessible(self):
+        if not (current_user.is_active and current_user.is_authenticated):
+            return False
+        if current_user.has_role('admin'):
+            self.can_create = True
+            return True
+        if current_user.has_role('finance'):
+            self.can_create = True
+            return True
+        return False
+
+    @expose('authorize', methods=['POST'])
+    def authorize_view(self):
+        return_url = self.get_url('.index_view')
+        # check permission
+        if not (current_user.has_role('admin') or current_user.has_role('finance') or current_user.has_role('merchant')):
+            # permission denied
+            flash('Not authorized.', 'error')
+            return redirect(return_url)
+        # get the model from the database
+        form = get_form_data()
+        if not form:
+            flash('Could not get form data.', 'error')
+            return redirect(return_url)
+        proposal_id = form['proposal_id']
+        proposal = self.get_one(proposal_id)
+        if proposal is None:
+            flash('Proposal not not found.', 'error')
+            return redirect(return_url)
+        # process the proposal
+        if proposal.status == proposal.STATE_CREATED:
+            proposal.status = proposal.STATE_AUTHORIZED
+            now = datetime.datetime.now()
+            proposal.date_authorized = now
+            proposal.date_expiry = now + datetime.timedelta(hours = Proposal.HOURS_EXPIRY)
+            proposal.authorizer = current_user
+
+        # commit to db
+        try:
+            self.session.commit()
+            flash('Proposal {proposal_id} set as authorized'.format(proposal_id=proposal_id))
+        except Exception as ex:
+            if not self.handle_view_exception(ex):
+                raise
+            flash('Failed to set proposal {proposal_id} as authorized'.format(proposal_id=proposal_id), 'error')
+        return redirect(return_url)
+
+    @expose('decline', methods=['POST'])
+    def decline_view(self):
+        return_url = self.get_url('.index_view')
+        # check permission
+        if not (current_user.has_role('admin') or current_user.has_role('finance') or current_user.has_role('merchant')):
+            # permission denied
+            flash('Not authorized.', 'error')
+            return redirect(return_url)
+        # get the model from the database
+        form = get_form_data()
+        if not form:
+            flash('Could not get form data.', 'error')
+            return redirect(return_url)
+        proposal_id = form['proposal_id']
+        proposal = self.get_one(proposal_id)
+        if proposal is None:
+            flash('Proposal not not found.', 'error')
+            return redirect(return_url)
+        # process the proposal
+        if proposal.status == proposal.STATE_CREATED:
+            proposal.status = proposal.STATE_DECLINED
+            proposal.authorizer = current_user
+        # commit to db
+        try:
+            self.session.commit()
+            flash('Proposal {proposal_id} set as declined'.format(proposal_id=proposal_id))
+        except Exception as ex:
+            if not self.handle_view_exception(ex):
+                raise
+            flash('Failed to set proposal {proposal_id} as declined'.format(proposal_id=proposal_id), 'error')
+        return redirect(return_url)
+
+    @expose('payments/<proposal_id>', methods=['GET'])
+    def payments_view(self, proposal_id):
+        return_url = self.get_url('.index_view')
+        # check permission
+        if not (current_user.has_role('admin') or current_user.has_role('finance') or current_user.has_role('merchant')):
+            # permission denied
+            flash('Not authorized.', 'error')
+            return redirect(return_url)
+        # get the model from the database
+        proposal = self.get_one(proposal_id)
+        if proposal is None:
+            flash('Proposal not not found.', 'error')
+            return redirect(return_url)
+        # show the proposal payments
+        return self.render('admin/payments.html', payments=proposal.payments)
+
+class WavesTxModelView(RestrictedModelView):
+    can_create = False
+    can_delete = False
+    can_edit = False
+
+    def _format_date(view, context, model, name):
+        if model.date:
+            return datetime.datetime.fromtimestamp(model.date).strftime('%Y-%m-%d %H:%M:%S')
+
+    def _format_json_data_html_link(view, context, model, name):
+        ids = model.id
+        json_obj = json.loads(model.json_data)
+        assetId = json_obj["assetId"]
+        feeAssetId = json_obj["feeAssetId"]
+        senderPublicKey = json_obj["senderPublicKey"]
+        recipient = json_obj["recipient"]
+        amount = json_obj["amount"]/100
+        fee = json_obj["fee"]/100
+        timestamp = json_obj["timestamp"]
+        attachment = json_obj["attachment"]
+        txtype = json_obj["type"]
+
+        html = '''
+        <button type="button" class="btn btn-primary" data-toggle="modal" data-target="#TxDetailsModal{}">
+        Tx Details
+        </button>
+<div class="modal fade" id="TxDetailsModal{}" tabindex="-1" role="dialog" aria-labelledby="TxDetailsModalLabel{}" aria-hidden="true">
+  <div class="modal-dialog" role="document">
+    <div class="modal-content">
+      <div class="modal-header">
+        <h4 class="modal-title" id="TxDetailModalLabel{}">Transaction Details</h4>
+        <button type="button" class="close" data-dismiss="modal" aria-label="Close">
+          <span aria-hidden="true">&times;</span>
+        </button>
+      </div>
+      <div class="modal-body">
+         assetId: {}<br/>
+         feeAssetId: {}<br/>
+         senderPublicKey: {}<br/>
+         recipient: {}<br/>
+         amount: {} {}<br/> 
+         fee: {}</br>
+         timestamp: {}<br/>
+         attachment: {}<br/>
+         type: {}<br/>
+      </div>
+      <div class="modal-footer">
+        <button type="button" class="btn btn-secondary" data-dismiss="modal">Close</button>
+      </div>
+    </div>
+  </div>
+</div>
+        '''.format(ids, ids, ids, ids, assetId, feeAssetId, senderPublicKey, recipient, amount, app.config["ASSET_NAME"], fee, timestamp, attachment, txtype)
+        return Markup(html)
+
+    def _format_txid_html(view, context, model, name):
+        ids = model.txid
+        truncate_txids = str(ids[:6]+'...')
+        html = '''
+        <button type="button" class="btn btn-primary" data-toggle="modal" data-target="#TxidModal{}">
+        {}
+        </button>
+<div class="modal fade" id="TxidModal{}" tabindex="-1" role="dialog" aria-labelledby="TxidModalLabel{}" aria-hidden="true">
+  <div class="modal-dialog" role="document">
+    <div class="modal-content">
+      <div class="modal-header">
+        <h5 class="modal-title" id="TxidModalLabel{}">Transaction ID</h5>
+        <button type="button" class="close" data-dismiss="modal" aria-label="Close">
+          <span aria-hidden="true">&times;</span>
+        </button>
+      </div>
+      <div class="modal-body">
+         {}
+      </div>
+      <div class="modal-footer">
+        <button type="button" class="btn btn-secondary" data-dismiss="modal">Close</button>
+      </div>
+    </div>
+  </div>
+</div>
+        '''.format(ids, truncate_txids, ids, ids, ids, ids)
+        return Markup(html)
+
+    column_list = ['date', 'txid', 'type', 'state', 'amount', 'json_data_signed', 'json_data']
+    column_formatters = {'date': _format_date, 'txid':_format_txid_html, 'json_data': _format_json_data_html_link}
+
+

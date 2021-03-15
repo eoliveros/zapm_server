@@ -22,23 +22,34 @@
 <br/>
 <br/>
 <div class="container">
-    {% if current_user.has_role("admin") or current_user.has_role("finance") %}
+    {% if current_user.has_role("admin") or current_user.has_role("finance") or current_user.has_role("merchant") %}
         <hr/>
-        <small>
-            General rates:
+	<small>
+            General Information:
             <ul>
                 <li>sales tax: <code>{{sales_tax * 100}}%</code></li>
-                <li>settlement fee: <code>${{settlement_fee}}</code></li>
-                <li>merchant: <code>{{merchant_rate * 100}}%</code></li>
-                <li>customer: <code>{{customer_rate * 100}}%</code></li>
+		{% if current_user.settlement_fee %}
+		<li>settlement fee: <code>${{current_user.settlement_fee}}</code></li>
+		{% else %}
+		<li>settlement fee: <code>${{settlement_fee}}</code></li>
+		{% endif %}
+		{% if current_user.merchant_rate %}
+		<li>merchant: <code>{{current_user.merchant_rate * 100}}%</code></li>
+		{% else %}
+		<li>merchant: <code>{{merchant_rate * 100}}%</code></li>
+		{% endif %}
+		{% if current_user.customer_rate %}
+		<li>customer: <code>{{current_user.customer_rate * 100}}%</code></li>
+		{% else %}
+		<li>customer: <code>{{customer_rate * 100}}%</code></li>
+		{% endif %}
             </ul>
-            Settlement address: <code>{{settlement_address}}</code> balance: <code>{{current_user.settlement_wallet_balance}}</code>
-        </small>
+	    Settlement address: <code>{{settlement_address}}</code> balance: <code>{{current_user.settlement_wallet_balance}}</code>
+	</small>
     {% endif %}
     {% if current_user.wallet_address %}
-        <hr/>
         <small>
-		Wallet address: <code>{{current_user.wallet_address}}</code> balance: <code>{{current_user.wallet_balance}}</code> 
+	    <br/>Wallet address: <code>{{current_user.wallet_address}}</code> balance: <code>{{current_user.wallet_balance}}</code> 
         </small>
     {% endif %}
 </div>

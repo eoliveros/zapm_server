@@ -5,22 +5,34 @@ import sys
 import json
 import time
 import requests
+import decimal
+import datetime
+from urllib.parse import urlparse
+import pywaves
 
-from flask import url_for, redirect, render_template, request, abort, jsonify
+import gevent
+from gevent.pywsgi import WSGIServer
+from flask import url_for, redirect, render_template, request, abort, jsonify, flash
 from flask_security.utils import encrypt_password
 from flask_socketio import Namespace, emit, join_room, leave_room
 from flask_security import current_user
+from flask_jsonrpc.exceptions import OtherError
 
 from app_core import app, db, socketio, aw
-from models import security, user_datastore, Role, User, Bank, ClaimCode, TxNotification, ApiKey, MerchantTx, Settlement
+from models import security, user_datastore, Role, User, Bank, ClaimCode, TxNotification, ApiKey, MerchantTx, Settlement, Category, Proposal, Payment, WavesTx, WavesTxSig, Seeds
 import admin
-from utils import check_hmac_auth, generate_key, apply_customer_rate, apply_merchant_rate
+from utils import check_hmac_auth, generate_key, apply_customer_rate, apply_merchant_rate, email_payment_claim, sms_payment_claim, qrcode_svg_create, is_address
 import bnz_ib4b
+import tx_utils
 
 logger = logging.getLogger(__name__)
 ws_api_keys = {}
 ws_sids = {}
 wallet_balances = {}
+
+SERVER_MODE = app.config["SERVER_MODE"]
+ASSET_ID = app.config["ASSET_ID"]
+NODE_BASE_URL = app.config["NODE_ADDRESS"]
 
 #
 # Helper functions
@@ -68,6 +80,15 @@ def add_role(email, role_name):
         else:
             logger.info("user already has role")
         db.session.commit()
+
+def create_category(name, desc):
+    category = Category.from_name(db.session, name)
+    if not category:
+        category = Category(name=name, description=desc)
+    else:
+        category.description = desc
+    db.session.add(category)
+    return category
 
 def add_merchant_codes():
     with app.app_context():
@@ -145,6 +166,11 @@ def bad_request(message):
     response.status_code = 400
     return response
 
+@app.template_filter()
+def int2asset(num):
+    num = decimal.Decimal(num)
+    return num/100
+
 #
 # Flask views
 #
@@ -160,7 +186,7 @@ def before_request_func():
         print(request.headers)
 
     if not current_user.is_anonymous:
-        if current_user.has_role("admin") or current_user.has_role("finance"):
+        if current_user.has_role("admin") or current_user.has_role("finance") or current_user.has_role("merchant"):
             current_user.settlement_wallet_balance = get_update_balance(app.config["SETTLEMENT_ADDRESS"])
         if current_user.wallet_address:
             current_user.wallet_balance = get_update_balance(current_user.wallet_address)
@@ -168,6 +194,183 @@ def before_request_func():
 @app.route("/")
 def index():
     return render_template("index.html")
+
+def process_claim_waves(payment, dbtx, recipient, asset_id):
+    if payment.proposal.status != payment.proposal.STATE_AUTHORIZED:
+        return dbtx, "payment not authorized"
+    if payment.status != payment.STATE_SENT_CLAIM_LINK:
+        return dbtx, "payment not authorized"
+    # create/get transaction
+    if not dbtx:
+        if asset_id and asset_id != ASSET_ID:
+            return dbtx, "'asset_id' does not match server"
+        try:
+            dbtx = _create_transaction_waves(recipient, payment.amount, "")
+            payment.txid = dbtx.txid
+            db.session.add(dbtx)
+            db.session.add(payment)
+            db.session.commit()
+        except OtherError as ex:
+            return dbtx, ex.message
+        except ValueError as ex:
+            return dbtx, ex
+    # broadcast transaction
+    try:
+        dbtx = tx_utils.broadcast_transaction(db.session, dbtx.txid)
+        payment.status = payment.STATE_SENT_FUNDS
+        db.session.add(dbtx)
+        db.session.commit()
+    except OtherError as ex:
+        return dbtx, ex.message
+    return dbtx, None
+
+def _create_transaction_waves(recipient, amount, attachment):
+    # get fee
+    path = f"/assets/details/{ASSET_ID}"
+    response = requests.get(NODE_BASE_URL + path)
+    if response.ok:
+        asset_fee = response.json()["minSponsoredAssetFee"]
+    else:
+        short_msg = "failed to get asset info"
+        logger.error(f"{short_msg}: ({response.status_code}, {response.request.method} {response.url}):\n\t{response.text}")
+        err = OtherError(short_msg, tx_utils.ERR_FAILED_TO_GET_ASSET_INFO)
+        err.data = response.text
+        raise err
+    if not recipient:
+        short_msg = "recipient is null or an empty string"
+        logger.error(short_msg)
+        err = OtherError(short_msg, tx_utils.ERR_EMPTY_ADDRESS)
+        raise err
+    if not is_address(recipient):
+        short_msg = "recipient is not a valid address"
+        logger.error(short_msg)
+        err = OtherError(short_msg, tx_utils.ERR_EMPTY_ADDRESS)
+        raise err
+    pywaves.setNode(NODE_BASE_URL, app.config["NODE_BASE_ENV"])
+    pywaves.setChain(app.config["NODE_BASE_ENV"])
+    seed_words = Seeds.query.filter_by(user_id = current_user.id).first()
+    sender = pywaves.Address(seed='{}'.format(seed_words))
+    recipient = pywaves.Address(recipient)
+    asset = pywaves.Asset(ASSET_ID)
+    address_data = sender.sendAsset(recipient, asset, amount, attachment, feeAsset=asset, txFee=asset_fee)
+    address_data["type"] = 4 # sendAsset does not include "type" - https://github.com/PyWaves/PyWaves/issues/131
+    signed_tx = json.dumps(address_data)
+    signed_tx = json.loads(signed_tx)
+    logger.info(signed_tx)
+    # calc txid properly
+    txid = tx_utils.tx_to_txid(signed_tx)
+    # store tx in db
+    dbtx = WavesTx(txid, "transfer", tx_utils.CTX_CREATED, signed_tx["amount"], True, json.dumps(signed_tx))
+    return dbtx
+
+def process_proposals():
+    with app.app_context():
+        # set expired
+        expired = 0
+        now = datetime.datetime.now()
+        proposals = Proposal.in_status(db.session, Proposal.STATE_AUTHORIZED)
+        for proposal in proposals:
+            if proposal.date_expiry < now:
+                proposal.status = Proposal.STATE_EXPIRED
+                expired += 1
+                db.session.add(proposal)
+        db.session.commit()
+        # process authorized
+        emails = 0
+        sms_messages = 0
+        proposals = Proposal.in_status(db.session, Proposal.STATE_AUTHORIZED)
+        for proposal in proposals:
+            for payment in proposal.payments:
+                if payment.status == payment.STATE_CREATED:
+                    if payment.email:
+                        email_payment_claim(logger, payment, proposal.HOURS_EXPIRY)
+                        payment.status = payment.STATE_SENT_CLAIM_LINK
+                        db.session.add(payment)
+                        logger.info(f"Sent payment claim url to {payment.email}")
+                        emails += 1
+                    elif payment.mobile:
+                        sms_payment_claim(logger, payment, proposal.HOURS_EXPIRY)
+                        payment.status = payment.STATE_SENT_CLAIM_LINK
+                        db.session.add(payment)
+                        logger.info(f"Sent payment claim url to {payment.mobile}")
+                        sms_messages += 1
+                    elif payment.wallet_address:
+                        ##TODO: set status and commit before sending so we cannot send twice
+                        raise Exception("not yet implemented")
+        db.session.commit()
+        logger.info(f"payment statuses commited")
+        return f"done (expired {expired}, emails {emails}, SMS messages {sms_messages})"
+
+@app.route("/claim_payment/<token>", methods=["GET", "POST"])
+def claim_payment(token):
+    qrcode = None
+    url = None
+    attachment = None
+    payment = Payment.from_token(db.session, token)
+    if not payment:
+        return bad_request('payment not found', 404)
+    now = datetime.datetime.now()
+    if now > payment.proposal.date_expiry and payment.status != payment.STATE_SENT_FUNDS:
+        return bad_request('expired', 404)
+
+    def render(recipient):
+        url_parts = urlparse(request.url)
+        url = url_parts._replace(scheme="zap", query='scheme={}'.format(url_parts.scheme)).geturl()
+        qrcode_svg = qrcode_svg_create(url)
+        return render_template("claim_payment.html", payment=payment, recipient=recipient, qrcode_svg=qrcode_svg, url=url)
+    def render_waves(dbtx):
+        recipient = None
+        if dbtx:
+            recipient = dbtx.tx_with_sigs()["recipient"]
+        return render(recipient)
+
+    if SERVER_MODE == 'waves':
+        dbtx = WavesTx.from_txid(db.session, payment.txid)
+
+    if request.method == "POST":
+        content_type = request.content_type
+        using_app = content_type.startswith('application/json')
+        logger.info("claim_payment: content type - {}, using_app - {}".format(content_type, using_app))
+        recipient = ""
+        asset_id = ""
+        if using_app:
+            content = request.get_json(force=True)
+            if content is None:
+                return bad_request("failed to decode JSON object")
+            if SERVER_MODE == 'waves':
+                params, err_response = get_json_params(logger, content, ["recipient", "asset_id"])
+                if err_response:
+                    return err_response
+                recipient, asset_id = params
+            else: # paydb
+                params, err_response = get_json_params(logger, content, ["recipient"])
+                if err_response:
+                    return err_response
+                recipient, = params
+        else: # using html form
+            try:
+                recipient = request.form["recipient"]
+            except:
+                flash("'recipient' parameter not present", "danger")
+                return render_waves(dbtx)
+            try:
+                asset_id = request.form["asset_id"]
+            except:
+                pass
+        if SERVER_MODE == 'waves':
+            dbtx, err_msg = process_claim_waves(payment, dbtx, recipient, asset_id)
+        else: # paydb
+            err_msg = process_claim_paydb(payment, recipient)
+        if err_msg:
+            logger.error("claim_payment: {}".format(err_msg))
+            if using_app:
+                return bad_request(err_msg)
+            flash(err_msg, "danger")
+    if SERVER_MODE == 'waves':
+        return render_waves(dbtx)
+    else: # paydb
+        return render(None)
+
 
 #
 # Test
@@ -460,41 +663,98 @@ def claim():
             return bad_request("already claimed")
     return abort(404)
 
+class WebGreenlet():
+
+    #def __init__(self, exception_func, addr="0.0.0.0", port=5000):
+    def __init__(self, addr="0.0.0.0", port=5000):
+        self.addr = addr
+        self.port = port
+        self.runloop_greenlet = None
+        #self.exception_func = exception_func
+
+        # create tables
+        logger.info("creating tables..")
+        db.create_all()
+        create_role("admin", "super user")
+        create_role("finance", "Can view/action settlements")
+        create_role("merchant", "Merchants can view/action their own rebate")
+        create_category("rebate", "")
+        db.session.commit()
+
+        # process commands
+        if len(sys.argv) > 1:
+            if sys.argv[1] == "add_user":
+                add_user(sys.argv[2], sys.argv[3])
+            if sys.argv[1] == "add_role":
+                add_role(sys.argv[2], sys.argv[3])
+            if sys.argv[1] == "add_merchant_codes":
+                add_merchant_codes()
+        else:
+            # check config
+            if "SETTLEMENT_ADDRESS" not in app.config:
+                logger.error("SETTLEMENT_ADDRESS does not exist")
+                sys.exit(1)
+            if "SENDER_BANK_ACCOUNT" not in app.config:
+                logger.error("SENDER_BANK_ACCOUNT does not exist")
+                sys.exit(1)
+            if "SENDER_NAME" not in app.config:
+                logger.error("SENDER_NAME does not exist")
+                sys.exit(1)
+    
+            ## Bind to PORT if defined, otherwise default to 5000.
+            #port = int(os.environ.get("PORT", 5000))
+            #logger.info("binding to port: %d" % port)
+            #socketio.run(app, host="0.0.0.0", port=port)
+            ## stop addresswatcher
+            if aw:
+                aw.kill()
+
+    def start(self):
+        def runloop():
+            logger.info("WebGreenlet runloop started")
+            logger.info(f"WebGreenlet webserver starting (addr: {self.addr}, port: {self.port})")
+            http_server = WSGIServer((self.addr, self.port), app)
+            http_server.serve_forever()
+
+        def process_proposals_loop():
+            while True:
+                gevent.spawn(process_proposals)
+                gevent.sleep(30)
+
+        def start_greenlets():
+            logger.info("starting WebGreenlet runloop...")
+            self.runloop_greenlet.start()
+            self.process_proposals_greenlet.start()
+
+        # create greenlet
+        self.runloop_greenlet = gevent.Greenlet(runloop)
+        self.process_proposals_greenlet = gevent.Greenlet(process_proposals_loop)
+        #if self.exception_func:
+        #    self.runloop_greenlet.link_exception(self.exception_func)
+        ## check node/wallet and start greenlets
+        gevent.spawn(start_greenlets)
+
+    def stop(self):
+        self.runloop_greenlet.kill()
+        self.process_proposals_greenlet.kill()
+
+
 if __name__ == "__main__":
-    setup_logging(logging.DEBUG)
-    logger.info("starting server..")
+    # setup logging
+    logger.setLevel(logging.DEBUG)
+    ch = logging.StreamHandler()
+    ch.setLevel(logging.DEBUG)
+    ch.setFormatter(logging.Formatter('[%(name)s %(levelname)s] %(message)s'))
+    logger.addHandler(ch)
+    # clear loggers set by any imported modules
+    logging.getLogger().handlers.clear()
 
-    # create tables
-    logger.info("creating tables..")
-    db.create_all()
-    create_role("admin", "super user")
-    create_role("finance", "Can view/action settlements")
-    db.session.commit()
+    web_greenlet = WebGreenlet()
+    web_greenlet.start()
 
-    # process commands
-    if len(sys.argv) > 1:
-        if sys.argv[1] == "add_user":
-            add_user(sys.argv[2], sys.argv[3])
-        if sys.argv[1] == "add_role":
-            add_role(sys.argv[2], sys.argv[3])
-        if sys.argv[1] == "add_merchant_codes":
-            add_merchant_codes()
-    else:
-        # check config
-        if "SETTLEMENT_ADDRESS" not in app.config:
-            logger.error("SETTLEMENT_ADDRESS does not exist")
-            sys.exit(1)
-        if "SENDER_BANK_ACCOUNT" not in app.config:
-            logger.error("SENDER_BANK_ACCOUNT does not exist")
-            sys.exit(1)
-        if "SENDER_NAME" not in app.config:
-            logger.error("SENDER_NAME does not exist")
-            sys.exit(1)
+    while 1:
+        gevent.sleep(1)
 
-        # Bind to PORT if defined, otherwise default to 5000.
-        port = int(os.environ.get("PORT", 5000))
-        logger.info("binding to port: %d" % port)
-        socketio.run(app, host="0.0.0.0", port=port)
-        # stop addresswatcher
-        if aw:
-            aw.kill()
+    web_greenlet.stop()
+
+
