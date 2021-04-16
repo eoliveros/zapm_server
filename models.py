@@ -365,8 +365,8 @@ class MerchantTx(db.Model):
     def update_wallet_address(cls, session, user):
         #seeds = db.session.query(Seeds).filter(Seeds.user_id == user.id).all()
         seeds = session.query(Seeds).filter(Seeds.user_id == user.id).all()
-        print(seeds.wallet_address)
-        logger.info(seeds.wallet_address)
+        print(seeds)
+        logger.info(seeds)
         if user.wallet_address:
             # update txs
             limit = 100
