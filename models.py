@@ -340,24 +340,47 @@ class MerchantTx(db.Model):
         return session.query(cls).filter(and_(cls.user_id == user.id), (cls.txid == txid)).scalar()
 
     @classmethod
+#    def update_wallet_address(cls, session, user):
+#        if user.wallet_address:
+#            # update txs
+#            limit = 100
+#            oldest_txid = None
+#            txs = []
+#            while True:
+#                have_tx = False
+#                txs = blockchain_transactions(logger, app.config["NODE_ADDRESS"], user.wallet_address, limit, oldest_txid)
+#                for tx in txs:
+#                    oldest_txid = tx["id"]
+#                    have_tx = MerchantTx.exists(db.session, user, oldest_txid)
+#                    if have_tx:
+#                        break
+#                    if tx["type"] == 4 and tx["assetId"] == app.config["ASSET_ID"]:
+#                        amount_nzd = apply_merchant_rate(tx['amount'], user, app.config, use_fixed_fee=False)
+#                        date = datetime.datetime.fromtimestamp(tx['timestamp'] / 1000)
+#                        session.add(MerchantTx(user, date, user.wallet_address, tx['amount'], amount_nzd, tx['id'], tx['direction'], tx['attachment']))
+#                if have_tx or len(txs) < limit:
+#                    break
+#            session.commit()
+
     def update_wallet_address(cls, session, user):
-        if user.wallet_address:
+        seeds = db.session.query(Seeds).filter(Seeds.user_id == user.id):
+        if seeds.wallet_address:
             # update txs
             limit = 100
             oldest_txid = None
             txs = []
             while True:
                 have_tx = False
-                txs = blockchain_transactions(logger, app.config["NODE_ADDRESS"], user.wallet_address, limit, oldest_txid)
+                txs = blockchain_transactions(logger, app.config["NODE_ADDRESS"], seeds.wallet_address, limit, oldest_txid)
                 for tx in txs:
                     oldest_txid = tx["id"]
                     have_tx = MerchantTx.exists(db.session, user, oldest_txid)
                     if have_tx:
                         break
                     if tx["type"] == 4 and tx["assetId"] == app.config["ASSET_ID"]:
-                        amount_nzd = apply_merchant_rate(tx['amount'], user, app.config, use_fixed_fee=False)
+                        amount_nzd = apply_merchant_rate(tx['amount'], seeds, app.config, use_fixed_fee=False)
                         date = datetime.datetime.fromtimestamp(tx['timestamp'] / 1000)
-                        session.add(MerchantTx(user, date, user.wallet_address, tx['amount'], amount_nzd, tx['id'], tx['direction'], tx['attachment']))
+                        session.add(MerchantTx(user, date, seeds.wallet_address, tx['amount'], amount_nzd, tx['id'], tx['direction'], tx['attachment']))
                 if have_tx or len(txs) < limit:
                     break
             session.commit()
