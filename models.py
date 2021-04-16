@@ -363,8 +363,8 @@ class MerchantTx(db.Model):
 #            session.commit()
 
     def update_wallet_address(cls, session, user):
-        seeds = db.session.query(Seeds).filter(Seeds.user_id == user.id)
-        print(seeds)
+        seeds = db.session.query(Seeds).filter(Seeds.user_id == user.id).all()
+        print(seeds.wallet_address)
         logger.info(seeds)
         if seeds.wallet_address:
             # update txs
